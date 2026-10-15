@@ -5,7 +5,7 @@ Commands:
   setup          Interactive setup wizard (run once per machine).
   run            Start the MCP server (used in Claude Desktop config).
   status         Check vault, binary, model, llama.cpp health, and feature config.
-  reindex        Rebuild the ChromaDB search index from vault folders.
+  reindex        Rebuild the search index from vault folders.
   maintain       Run inbox maintenance once and exit (used by the SessionStart hook).
   dashboard-api  Run the local JSON API used by the Tauri dashboard (standalone/debug).
   ingest         Index files from an external folder without moving them.
@@ -196,6 +196,39 @@ def cmd_update(args):
     return 0 if estado == "ok" else 1
 
 
+def cmd_eval_search(args):
+    """Mede a busca com perguntas de resposta conhecida, por escopo.
+
+    Pergunta pelo daemon em execucao; nunca abre o indice num segundo processo.
+    O arquivo de perguntas fica fora do repositorio: ver delegation_core.avaliacao.
+    """
+    from . import avaliacao
+    from .config import Config
+    from .daemon import DaemonUnavailable
+
+    cfg = Config.load()
+    try:
+        consultas = avaliacao.carregar(args.arquivo)
+    except (OSError, ValueError) as e:
+        print(f"Nao li as perguntas: {e}", file=sys.stderr)
+        return 1
+    escopos = [e.strip() for e in args.scope.split(",") if e.strip()]
+    try:
+        resultados = avaliacao.avaliar(consultas, avaliacao.buscador_do_daemon(cfg),
+                                       escopos, k=args.k)
+    except DaemonUnavailable as e:
+        print(f"Daemon fora do ar: {e}", file=sys.stderr)
+        return 1
+    if args.json:
+        print(json.dumps([r.resumo() for r in resultados], ensure_ascii=False, indent=2))
+        return 0
+    for r in resultados:
+        print(f"{r.escopo:16s} acertos@{r.k} {r.acertos}/{r.total}  mrr {r.mrr}")
+        for erro in r.erros:
+            print(f"    x {erro['pergunta']}")
+    return 0
+
+
 def cmd_update_finish(args):
     """Second half of `update`, run by it in the version pip just installed.
 
@@ -384,12 +417,19 @@ def cmd_service(args):
     console = Console()
     result = {"install": _service.install,
               "uninstall": _service.uninstall,
-              "status": _service.status}[args.action]()
+              "status": _service.status,
+              "stop": _service.stop,
+              "start": _service.start,
+              "restart": _service.restart}[args.action]()
 
     for key, value in result.items():
         console.print(f"[bold]{key}[/bold]: {value}")
-    if result.get("status") == "unsupported":
-        return 1
+    # main() descarta o valor de retorno dos comandos, entao um `return 1` aqui
+    # nunca virava codigo de saida. As instrucoes da migracao do indice encadeiam
+    # estes comandos: sair com 0 depois de falhar faria o passo seguinte rodar
+    # com o daemon ainda no ar.
+    if result.get("status") in ("unsupported", "failed"):
+        sys.exit(1)
     return 0
 
 
@@ -482,6 +522,15 @@ def _index_row_counts(cfg, timeout: float = 10.0) -> tuple[dict[str, int], str]:
         else:
             rows = stats.get("indexed_rows")
             return ({cfg.collection_name: rows} if isinstance(rows, int) else {}), "daemon"
+
+    if cfg.usa_sqlite:
+        # Sem o risco do Chroma: abrir e contar nao escreve, nem muda o mtime.
+        from .indice_sqlite import ClienteSqlite
+        sq = ClienteSqlite(cfg.sqlite_path)
+        try:
+            return {c.name: c.count() for c in sq.list_collections()}, "local"
+        finally:
+            sq.close()
 
     import chromadb
     client = chromadb.PersistentClient(path=str(cfg.chroma_path))
@@ -616,7 +665,7 @@ def cmd_status(_args):
     # costs hours on a real vault.
     rows = counts.get(cfg.collection_name)
     if source.startswith("daemon-unresponsive"):
-        table.add_row("ChromaDB", f"[red]✗[/red]  daemon on {cfg.server_host}:{cfg.server_port} "
+        table.add_row("Index", f"[red]✗[/red]  daemon on {cfg.server_host}:{cfg.server_port} "
                                   f"accepts connections but does not answer "
                                   f"({source.split(': ', 1)[1]}). Restart it.")
     elif rows:
@@ -624,9 +673,9 @@ def cmd_status(_args):
         # number runs well ahead of the note count and calling it notes invites
         # exactly the wrong conclusion about the size of the vault.
         via = "  [dim](via daemon)[/dim]" if source == "daemon" else ""
-        table.add_row("ChromaDB", f"[green]✓[/green]  {rows} rows indexed{via}")
+        table.add_row("Index", f"[green]✓[/green]  {rows} rows indexed{via}")
     else:
-        table.add_row("ChromaDB", "[dim]not initialized: run: delegation-core reindex[/dim]")
+        table.add_row("Index", "[dim]not initialized: run: delegation-core reindex[/dim]")
 
     # v0.2 feature flags
     table.add_row("budget_mode",  cfg.budget_mode)
@@ -723,6 +772,68 @@ def cmd_reindex(args):
     vault = VaultManager(cfg)
     count = vault.reindex_vault(force=force)
     console.print(f"[green]✓[/green]  {count} notes indexed.")
+
+
+def cmd_index_migrate(args):
+    """Chroma -> SQLite, com exportacao neutra e verificacao antes de trocar."""
+    from rich.console import Console
+    from . import migracao_indice
+    from .config import Config
+
+    console = Console()
+    cfg = Config.load()
+    if not cfg.is_configured():
+        console.print("[yellow]Not configured.[/yellow] Run: delegation-core setup")
+        sys.exit(1)
+    origem = Path(args.origem).expanduser() if args.origem else None
+    console.print(f"Migrando o indice de [bold]{origem or cfg.chroma_path}[/bold] "
+                  f"para [bold]{cfg.sqlite_path}[/bold] ...")
+    try:
+        r = migracao_indice.migrar(cfg, origem=origem, amostra=args.amostra,
+                                   forcar=args.force)
+    except RuntimeError as e:
+        console.print(f"[red]✗[/red]  {e}")
+        sys.exit(1)
+    for nome, v in r["verificacao"]["colecoes"].items():
+        console.print(f"[green]✓[/green]  {nome}: {v['linhas_destino']} linhas, "
+                      f"texto, metadados e vetores identicos; "
+                      f"{v.get('consultas_iguais_a_busca_exata', 0)}/{v.get('consultas', 0)} "
+                      f"consultas iguais a busca exata; sobreposicao com o Chroma "
+                      f"{v.get('sobreposicao_media_com_o_chroma', 'n/d')}")
+    console.print(f"Exportacao neutra guardada em [bold]{r['exportacao']}[/bold] "
+                  "(pode apagar depois de validar). O indice do Chroma nao foi tocado.")
+    if args.ativar:
+        cfg.index_backend = "sqlite"
+        cfg.save()
+        console.print("[green]✓[/green]  index_backend = sqlite. Reinicie o daemon.")
+    else:
+        # Com index_backend vazio o indice SQLite recem-criado passaria a ser o
+        # usado na proxima partida. Quem nao pediu para trocar fica onde estava.
+        if not str(cfg.index_backend or "").strip():
+            cfg.index_backend = "chroma"
+            cfg.save()
+        console.print('O daemon continua no Chroma ate voce ativar: rode de novo com --ativar '
+                      'ou defina "index_backend": "sqlite" no config e reinicie o daemon. '
+                      'Para voltar: "chroma".')
+
+
+def cmd_index_compare(args):
+    """Roda as mesmas consultas nos dois indices e mostra onde divergem."""
+    from rich.console import Console
+    from . import migracao_indice
+    from .config import Config
+
+    console = Console()
+    cfg = Config.load()
+    try:
+        r = migracao_indice.comparar(cfg, amostra=args.amostra,
+                                     origem=Path(args.origem).expanduser() if args.origem else None)
+    except RuntimeError as e:
+        console.print(f"[red]✗[/red]  {e}")
+        sys.exit(1)
+    for nome, v in r["colecoes"].items():
+        console.print(f"{nome}: {v['consultas']} consultas, sobreposicao media "
+                      f"{v['sobreposicao_media']}, {v['consultas_com_menos_de_70pc']} abaixo de 70%")
 
 
 def cmd_dashboard_api(args):
@@ -1295,6 +1406,37 @@ def cmd_graph_extract_sources(args):
     console.print(f"\nAgora: delegation-core graph build {result['out_dir']}")
 
 
+def cmd_embed_llama(args):
+    """Show or set up the llama.cpp backend for the BGE embeddings."""
+    from rich.console import Console
+    from . import embed_llama
+    from .config import Config
+    from .embeddings import resolver_backend
+
+    console = Console()
+    cfg = Config.load()
+    if not cfg.is_configured():
+        console.print("[yellow]Not configured.[/yellow] Run: delegation-core setup")
+        sys.exit(1)
+
+    if args.action == "setup":
+        console.print(f"Preparing {cfg.bge_model} on llama.cpp...")
+        r = embed_llama.preparar(cfg, baixar=not args.no_download)
+        if r["status"] != "ok":
+            console.print(f"[red]Failed[/red] ({r.get('step', '?')}): {r['detail']}")
+            sys.exit(1)
+        console.print(f"[green]✓[/green] llama-server: {r['binary']}\n[green]✓[/green] GGUF: {r['gguf']} "
+                      f"({r['dim']}-dim vectors)\n[green]✓[/green] embed_backend = llamacpp")
+        console.print("Restart the server to apply it: [bold]delegation-core service restart[/bold] "
+                      "(the index is the same: no reindex needed).")
+        return
+
+    console.print(f"backend:     {resolver_backend(cfg)}  (embed_backend = {cfg.embed_backend})")
+    console.print(f"llama-server: {embed_llama.achar_llama_server(cfg) or '[red]not found[/red]'}")
+    console.print(f"GGUF:         {cfg.embed_gguf or '[dim]not set[/dim]'}")
+    console.print(f"port:         {cfg.embed_port}  ({'up' if embed_llama.servidor_para(cfg).healthy() else 'down'})")
+
+
 def cmd_embed_model(args):
     """List the calibrated embedding models, or switch to one."""
     from rich.console import Console
@@ -1518,7 +1660,7 @@ def cmd_recover_index(args):
 
     novo = str(Path(args.index_path).expanduser().resolve()) if args.index_path else None
     if not args.yes:
-        console.print(f"Index at [bold]{cfg.chroma_path}[/bold] will be moved aside "
+        console.print(f"Index at [bold]{cfg.index_dir}[/bold] will be moved aside "
                       "(renamed, not deleted), and the daemon will rebuild it from the "
                       "vault and every ingest source on its next start.")
         if novo:
@@ -1561,8 +1703,8 @@ def cmd_ingest_registry(args):
         console.print("[yellow]Not configured.[/yellow] Run: delegation-core setup")
         sys.exit(1)
 
-    origem = Path(args.from_index).expanduser() if args.from_index else cfg.chroma_path
-    em_uso = origem.resolve() == Path(cfg.chroma_path).resolve()
+    origem = Path(args.from_index).expanduser() if args.from_index else cfg.index_dir
+    em_uso = origem.resolve() == Path(cfg.index_dir).resolve()
     if args.queue:
         if em_uso:
             console.print("[red]✗[/red] --queue is for an index that is no longer in use "
@@ -1767,7 +1909,7 @@ def cmd_process_get(args):
 def main():
     parser = argparse.ArgumentParser(
         prog="delegation-core",
-        description="Local MCP delegation server: llama.cpp + BGE + ChromaDB + Obsidian vault",
+        description="Local MCP delegation server: llama.cpp + BGE + SQLite vector index + Obsidian vault",
     )
     sub = parser.add_subparsers(dest="command", metavar="command")
 
@@ -1792,6 +1934,15 @@ def main():
                           help="Leave the daemon stopped after updating")
     # Internal: `update` runs this in a fresh interpreter after pip, so the
     # steps that follow come from the version just installed. No help text.
+    p_eval = sub.add_parser(
+        "eval-search",
+        help="Measure search against questions with known answers, per scope")
+    p_eval.add_argument("arquivo", help="JSON list of {pergunta, esperado}")
+    p_eval.add_argument("--k", type=int, default=5, help="Results checked per question")
+    p_eval.add_argument("--scope", default="notes,notes+external,all",
+                        help="Comma-separated scopes to compare")
+    p_eval.add_argument("--json", action="store_true", help="Print the full result as JSON")
+
     p_update_finish = sub.add_parser("update-finish")
     p_update_finish.add_argument("--root", required=True)
 
@@ -1820,8 +1971,8 @@ def main():
                              help="Print exactly what would be removed; touch nothing")
 
     p_service = sub.add_parser(
-        "service", help="Install/remove the daemon as a per-user background service")
-    p_service.add_argument("action", choices=["install", "uninstall", "status"])
+        "service", help="Install/remove/stop/start the daemon as a per-user background service")
+    p_service.add_argument("action", choices=["install", "uninstall", "status", "stop", "start", "restart"])
 
     p_clients = sub.add_parser(
         "clients", help="Point MCP clients at the HTTP daemon (migrates from stdio)")
@@ -1856,7 +2007,15 @@ def main():
     p_registry.add_argument("--queue", action="store_true",
                             help="Queue the sources for re-ingestion by the daemon "
                                  "(only with --from pointing to an index no longer in use)")
-    p_reindex = sub.add_parser("reindex", help="Rebuild ChromaDB search index from vault folders")
+    p_mig = sub.add_parser("index-migrate", help="Migrate the ChromaDB index to the SQLite index, verified, without touching the old one")
+    p_mig.add_argument("--from", dest="origem", default=None, help="Chroma index directory (default: the configured one)")
+    p_mig.add_argument("--amostra", type=int, default=50, help="queries used to compare neighbours")
+    p_mig.add_argument("--ativar", action="store_true", help="set index_backend=sqlite after a verified migration")
+    p_mig.add_argument("--force", action="store_true", help="migrate even with the daemon listening (unsafe)")
+    p_cmp = sub.add_parser("index-compare", help="Run the same queries on the Chroma and SQLite indexes")
+    p_cmp.add_argument("--from", dest="origem", default=None)
+    p_cmp.add_argument("--amostra", type=int, default=100)
+    p_reindex = sub.add_parser("reindex", help="Rebuild the search index from vault folders")
     p_reindex.add_argument("--force", action="store_true",
                            help="Reindex every note, not just those changed since last run "
                                 "(needed to backfill new metadata fields)")
@@ -1875,6 +2034,14 @@ def main():
                          help="Model to switch to; omit to list what is available")
     p_embed.add_argument("--reindex", action="store_true",
                          help="Reindex the vault into the new model's collection")
+
+    p_embed_llama = sub.add_parser(
+        "embed-llama",
+        help="Run the BGE search model on llama.cpp instead of torch (the Mac setup)")
+    p_embed_llama.add_argument("action", nargs="?", choices=["setup", "status"], default="status",
+                               help="setup: find llama-server, download the GGUF, switch the backend on")
+    p_embed_llama.add_argument("--no-download", action="store_true",
+                               help="do not download anything; use what is already on disk")
 
     p_dashboard_api = sub.add_parser(
         "dashboard-api", help="Run the local JSON API used by the Tauri dashboard (standalone/debug)"
@@ -2014,6 +2181,7 @@ def main():
         "service":  cmd_service,
         "update":   cmd_update,
         "update-finish": cmd_update_finish,
+        "eval-search": cmd_eval_search,
         "repair-empty-source": cmd_repair_empty_source,
         "post-install": cmd_post_install,
         "uninstall": cmd_uninstall,
@@ -2024,6 +2192,8 @@ def main():
         "recover-index": cmd_recover_index,
         "ingest-registry": cmd_ingest_registry,
         "reindex":  cmd_reindex,
+        "index-migrate": cmd_index_migrate,
+        "index-compare": cmd_index_compare,
         "maintain": cmd_maintain,
         "dashboard-api": cmd_dashboard_api,
         "ingest":   cmd_ingest,
@@ -2031,6 +2201,7 @@ def main():
         "search":   cmd_search,
         "compress": cmd_compress,
         "embed-model": cmd_embed_model,
+        "embed-llama": cmd_embed_llama,
     }
 
     note_dispatch = {

@@ -266,3 +266,38 @@ def _config_real_intacta():
             "da maquina: use o tmp_path que conftest._sem_escrita_no_estado_real "
             "ja instalou. O arquivo foi restaurado."
         )
+
+
+
+@pytest.fixture
+def backend_chroma(monkeypatch):
+    """Fixa o indice do Chroma, o padrao ate a migracao para SQLite.
+
+    Para os testes cujo assunto E o Chroma: reabertura de cliente, quarentena da
+    pasta `.chroma_bge`, leitura de `chroma.sqlite3` e a recuperacao desse indice.
+    Os demais usam o padrao (SQLite num vault novo).
+    """
+    from delegation_core.config import Config
+    monkeypatch.setattr(Config, "usa_sqlite", property(lambda self: False))
+
+
+def pytest_addoption(parser):
+    parser.addoption("--atualizar-baseline-evals", action="store_true", default=False,
+                     help="regrava tests/evals_busca/baseline.json com as metricas medidas agora")
+
+
+@pytest.fixture(autouse=True)
+def _token_do_dashboard(request, monkeypatch):
+    """Instala o bearer token que a API do dashboard exige, so nos testes dela.
+
+    O servidor falha fechado sem token, entao sem isto todo teste de rota levaria
+    401. Os testes mandam `tests._dashboard_auth.AUTH` de forma explicita em cada
+    chamada: este fixture so decide o que o servidor aceita, nao o que o cliente
+    envia, e por isso nao deixa passar um teste que esqueceu a cabecalho.
+    """
+    if "dashboard" not in request.module.__name__:
+        return
+    from delegation_core import dashboard_api
+    from tests._dashboard_auth import TOKEN
+
+    monkeypatch.setattr(dashboard_api, "_token", TOKEN)

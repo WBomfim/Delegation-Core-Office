@@ -1,6 +1,6 @@
 # Delegation-Core Office
 
-A local MCP delegation server: a markdown vault (semantic search via BGE + ChromaDB), an
+A local MCP delegation server: a markdown vault (semantic search via BGE + a SQLite vector index), an
 optional local LLM (llama.cpp) for summarization/synthesis, and a vendored code-graph
 pipeline - all usable either as an MCP server (Claude Desktop/Code) or directly from a
 terminal via the `delegation-core` CLI. It runs as one HTTP daemon that every client shares,
@@ -13,7 +13,7 @@ protocol an AI agent should follow when this MCP server is connected.
 ## What it does
 
 - **Vault**: an Obsidian-compatible markdown vault, semantically searchable via BGE
-  embeddings + ChromaDB. Drop files into `_inbox/` and they get classified, synthesized into
+  embeddings over a single SQLite file (exact search in numpy). Drop files into `_inbox/` and they get classified, synthesized into
   clean notes, wikilinked, and filed - or write/read/search notes directly.
 - **Code graph** (opt-in, `[graph]` extra): build a knowledge graph of a codebase - AST
   extraction across ~30 languages via tree-sitter, community detection, god-node/blast-radius
@@ -34,6 +34,8 @@ otherwise the latest GitHub release, falling back to manual build instructions i
 is available), then launches the setup wizard automatically. Re-running it on an existing
 install upgrades in place - `config.json` is preserved and the prior install is backed up,
 the wizard is not re-run.
+
+To update an existing install from GitHub, run `delegation-core update`; see `docs/ATUALIZAR.md`.
 
 ```bash
 ./install.sh              # Linux / macOS
@@ -94,7 +96,7 @@ separate setting.
 
 This is a one-time migration for anyone upgrading from v0.10 or earlier, which spoke stdio:
 a leftover `{"command": ..., "args": ["run"]}` entry spawns a second server that fights the
-daemon for the port, the ChromaDB index, and the GPU. One daemon means one resident copy of
+daemon for the port, the index, and the GPU. One daemon means one resident copy of
 BGE-m3 instead of one per client.
 
 Once connected, ask the running server what it can do - `capabilities()` reports the live
@@ -131,7 +133,28 @@ Set in `config.json` (`engine_mode`), chosen during `setup`:
 - **`hybrid`** - light interactive work delegates to the calling agent; heavy/background work
   (maintenance, healing, bulk synthesis) always runs locally.
 
-BGE embeddings + ChromaDB search always run locally in every mode.
+BGE embeddings + the SQLite index search always run locally in every mode.
+
+### Vector index
+
+The index is one SQLite file in WAL mode (`<vault>/.indice_sqlite/indice.db`) with exact
+search in numpy: text, metadata and vector are written in one transaction, so a process
+killed mid-write leaves nothing half done, and several processes can read and write at
+once. It replaces ChromaDB, whose latest release (1.5.9) has open corruption bugs upstream
+(issues 7510, 7238, 7678). `docs/indice-sqlite.md` has the design, the measurements and
+the limits.
+
+A vault that still has a ChromaDB index keeps using it until you migrate:
+
+```bash
+delegation-core service stop
+delegation-core index-migrate --ativar   # exports, imports, verifies row by row, then switches
+delegation-core service start
+```
+
+The old index is never touched, so `index_backend: "chroma"` goes back to it. `chromadb`
+is an optional extra (`pip install 'delegation-core[chroma]'`), needed only to read an old
+index and migrate.
 
 ## Development
 
@@ -140,7 +163,7 @@ pip install -e ".[dev]"
 pytest tests/ -q
 ```
 
-The suite is fast and offline, with no ChromaDB/BGE/llama.cpp dependency (the heavier
+The suite is fast and offline, with no BGE/llama.cpp dependency (the heavier
 collaborators are faked), and `tests/conftest.py` keeps a run from touching the real
 `~/.delegation_core`. A test total used to be printed here and drifted to roughly half
 the real figure; run `pytest tests/ -q` for the number. They cover config, vault helpers and browsing, search scoping,
@@ -154,5 +177,7 @@ real model to say anything useful.
 - `AGENT_GUIDE.md` - full MCP tool reference and protocol, written for the AI agent side.
 - `CHANGELOG.md` - version history.
 - `DEPLOYMENT_LOG.md` - per-deployment upgrade notes (this repo runs on more than one machine).
+- `docs/ATUALIZAR.md` - updating an install from GitHub with `delegation-core update`, and when to migrate the index.
+- `docs/evals-de-busca.md` - the retrieval evals that run with the test suite: 40 notes, 40 questions, and a baseline that fails when search gets worse.
 - `docs/INGEST_CONFIGURATION.md` - declarative ingestion sources, exclusions and safe re-ingestion.
 - `THIRD_PARTY_LICENSES/` - attribution for vendored code (Graphify).
