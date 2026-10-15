@@ -415,12 +415,14 @@ def cmd_service(args):
     from . import service as _service
 
     console = Console()
-    result = {"install": _service.install,
-              "uninstall": _service.uninstall,
-              "status": _service.status,
-              "stop": _service.stop,
-              "start": _service.start,
-              "restart": _service.restart}[args.action]()
+    if args.action == "install":
+        result = _service.install(visible=bool(getattr(args, "visible", False)))
+    else:
+        result = {"uninstall": _service.uninstall,
+                  "status": _service.status,
+                  "stop": _service.stop,
+                  "start": _service.start,
+                  "restart": _service.restart}[args.action]()
 
     for key, value in result.items():
         console.print(f"[bold]{key}[/bold]: {value}")
@@ -774,6 +776,11 @@ def cmd_reindex(args):
     console.print(f"[green]✓[/green]  {count} notes indexed.")
 
 
+def _texto_dos_empates(n: int) -> str:
+    """Explica por que "iguais" inclui consultas cujo conjunto de ids difere."""
+    return (f" ({n} com empate de nota no 10o lugar, desempate valido)" if n else "")
+
+
 def cmd_index_migrate(args):
     """Chroma -> SQLite, com exportacao neutra e verificacao antes de trocar."""
     from rich.console import Console
@@ -798,7 +805,8 @@ def cmd_index_migrate(args):
         console.print(f"[green]✓[/green]  {nome}: {v['linhas_destino']} linhas, "
                       f"texto, metadados e vetores identicos; "
                       f"{v.get('consultas_iguais_a_busca_exata', 0)}/{v.get('consultas', 0)} "
-                      f"consultas iguais a busca exata; sobreposicao com o Chroma "
+                      f"consultas iguais a busca exata"
+                      f"{_texto_dos_empates(v.get('consultas_com_empate', 0))}; sobreposicao com o Chroma "
                       f"{v.get('sobreposicao_media_com_o_chroma', 'n/d')}")
     console.print(f"Exportacao neutra guardada em [bold]{r['exportacao']}[/bold] "
                   "(pode apagar depois de validar). O indice do Chroma nao foi tocado.")
@@ -1605,8 +1613,10 @@ def cmd_doctor(args):
         sys.exit(1)
 
     if getattr(args, "clean_orphans", False):
-        cleaned = doctor.clean_orphan_segments(cfg)
-        console.print(f"[green]✓[/green] Cleaned {cleaned} orphan segment directory(ies).")
+        incluir = bool(getattr(args, "include_backups", False))
+        cleaned = doctor.clean_orphan_segments(cfg, include_backups=incluir)
+        console.print(f"[green]✓[/green] Cleaned {cleaned} orphan segment directory(ies)"
+                      + ("" if incluir else " (index backups were kept; --include-backups removes them)") + ".")
 
     if getattr(args, "rebuild_fts", False):
         rebuilt = doctor.rebuild_fts(cfg)
@@ -1907,6 +1917,8 @@ def cmd_process_get(args):
 
 
 def main():
+    from .stdio_nulo import garantir_stdio
+    garantir_stdio()
     parser = argparse.ArgumentParser(
         prog="delegation-core",
         description="Local MCP delegation server: llama.cpp + BGE + SQLite vector index + Obsidian vault",
@@ -1973,6 +1985,9 @@ def main():
     p_service = sub.add_parser(
         "service", help="Install/remove/stop/start the daemon as a per-user background service")
     p_service.add_argument("action", choices=["install", "uninstall", "status", "stop", "start", "restart"])
+    p_service.add_argument("--visible", action="store_true",
+                           help="install, Windows: run the daemon in a visible console window "
+                                "(default is no window), for diagnosing a daemon that did not start")
 
     p_clients = sub.add_parser(
         "clients", help="Point MCP clients at the HTTP daemon (migrates from stdio)")
@@ -1989,7 +2004,11 @@ def main():
     sub.add_parser("status",   help="Check vault, model, binary, llama.cpp, and feature config")
     p_doctor = sub.add_parser("doctor",   help="Diagnose installation drift and vault hygiene problems")
     p_doctor.add_argument("--clean-orphans", action="store_true",
-                          help="Remove orphan ChromaDB segment directories on disk")
+                          help="Remove orphan ChromaDB segment directories on disk "
+                               "(index backups from update/index-migrate are kept)")
+    p_doctor.add_argument("--include-backups", action="store_true",
+                          help="With --clean-orphans: also remove the .chroma*-backup-* "
+                               "directories, the way back to the previous index")
     p_doctor.add_argument("--rebuild-fts", action="store_true",
                           help="Rebuild SQLite full-text search index if corrupted")
     p_recover = sub.add_parser(
