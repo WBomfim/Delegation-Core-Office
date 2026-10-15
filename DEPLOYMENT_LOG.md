@@ -196,6 +196,65 @@ Verify the reload succeeded by checking `heartbeat` now reports `engine_mode`.
 
 ---
 
+## Indice SQLite em producao: troca do ChromaDB (2026-10-07)
+
+**Action.** O daemon de producao passou a usar o indice SQLite com busca exata em numpy, no lugar do ChromaDB 1.5.9, que tem defeitos de corrupcao abertos no upstream (7510, 7238, 7678) e nenhuma correcao publicada.
+
+**Details.**
+- **Codigo:** branch `feat/indice-sqlite`, feita sobre a `master` de producao (`2c4204d`). O instalado era identico a `master` antes da troca, entao o indice foi a unica mudanca de comportamento. Instalado de `/home/joey/Projects/delegation-core-sqlite` (nao editavel).
+- **Passos:** daemon parado e confirmado sem nada segurando o indice; backup consistente do Chroma em `.chroma_bge-backup-20261007-pre-sqlite` e copia do `config.json`; instalacao do codigo; `delegation-core index-migrate --ativar`; daemon no ar em 4 s.
+- **Migracao:** 41.314 chunks de 16.956 documentos, texto, metadados e vetores identicos bit a bit, 50 de 50 consultas iguais a busca exata, 28 s. O indice do Chroma ficou intocado em `.chroma_bge`.
+- **Verificacao no ambiente vivo:** o daemon tem os arquivos do `indice.db` abertos e nenhum do Chroma; heartbeat saudavel; buscas em 0,11 a 0,14 s; escrita pelo daemon e por um segundo processo escrevendo direto no indice com o daemon vivo (o cenario que corrompia o Chroma), vistos sem reiniciar; `doctor` sem avisos nem erros.
+- **Rollback:** `index_backend: chroma` no config, reinstalar a `master` de `/home/joey/Projects/delegation-core` e subir o daemon. O que for escrito depois da troca so volta com `reindex --force`.
+- **Efeito colateral:** as conexoes MCP das sessoes abertas durante a parada perdem as ferramentas e precisam ser reconectadas (`/mcp`) ou a sessao reiniciada.
+
+
+---
+
+## v0.16.0 em producao (2026-10-09)
+
+**Action.** O daemon de producao passou do commit `1d9855a` (versao 0.15.0 no codigo, indice SQLite desde 07/10) para a **v0.16.0** (merge `be206bf`, tag anotada `v0.16.0`). Sequencia: PRs 30, 31, 32 e 33 mesclados, cada um com a suite verde em Linux, Windows e macOS; `git pull --ff-only`; `pip install --no-deps --force-reinstall`; `systemctl --user restart delegation-core`.
+
+**O que entrou desde a v0.15.0.** Indice SQLite no lugar do ChromaDB (migracao opt-in e verificada), wizard revisado, fila local sem regravacao ociosa, ferramentas fora do laco, motor MLX, `service stop|start|restart` (que o README ja mandava usar e nao existiam), secundarios do relato de campo e evals da busca no CI. O BGE pelo llama.cpp esta marcado como experimental e opt-in.
+
+**Verificacao feita em 09/10, depois do restart.**
+- Versao instalada: `0.16.0`.
+- `delegation-core doctor`: 12 ok, 0 avisos, 0 erros, 2 puladas (as checagens do ChromaDB, que nao se aplicam ao indice SQLite).
+- `delegation-core status`: 41.622 linhas indexadas, lidas pelo daemon; `index_integrity`: indice SQLite ok, 41.622 chunks.
+- Servico ativo desde 10:29:59, sem reinicios (`NRestarts=0`); o log mostra so as linhas informativas do watchdog.
+
+**Nao verificado.**
+- A migracao do indice (`index-migrate`) em macOS e em Windows: so rodou em Linux e nos testes de CI.
+- O BGE pelo llama.cpp com Metal: validado apenas em CPU no Linux.
+- `delegation-core update` de uma instalacao em 0.15.0 para a 0.16.0 nas outras maquinas.
+- O `heartbeat()` por uma sessao MCP depois do restart.
+
+**Efeito colateral.** As conexoes MCP das sessoes abertas durante o restart perdem as ferramentas e precisam ser reconectadas (`/mcp`) ou a sessao reiniciada.
+
+---
+
+## v0.16.1 em producao (2026-10-13)
+
+**Action.** O daemon de producao passou da **v0.16.0** para a **v0.16.1** (merge `01136c1`, PR 40, tag anotada `v0.16.1`) com `delegation-core update` (etapas locate_source, stop_service, git_pull, pip_install, finish_in_new_code, refresh_docs, register_hooks, register_service e start_service, todas OK). Servico no ar desde 14:55:29, `NRestarts=0`.
+
+**O que entrou desde a v0.16.0.** BGE com uma partida so do `llama-server` entre processos (C15), instalador sem `chromadb` obrigatorio (PR 39, Luiz Capelin), busca exata sem copiar a matriz a cada consulta (180 ms para 27 ms com 400 mil trechos), teste do kill -9 que deixa de decidir pelo relogio, textos do servidor sem ChromaDB e o guia `docs/ATUALIZAR.md`.
+
+**Verificacao feita em 13/10, depois do restart.**
+- Versao instalada: `0.16.1` (`pip show`).
+- `delegation-core doctor`: 12 ok, 0 avisos, 0 erros, 2 puladas (as checagens do ChromaDB, que nao se aplicam ao indice SQLite).
+- `delegation-core status`: 41.703 linhas indexadas, lidas pelo daemon; `index_integrity`: indice SQLite ok, 41.703 chunks.
+- `heartbeat()` e `search_vault` por uma sessao MCP reconectada: `healthy`, sem jobs em segundo plano, e a busca achou uma nota escrita minutos antes.
+- O indice nao foi tocado pela atualizacao (nenhuma migracao, nenhum reindex).
+
+**Nao verificado.**
+- A migracao do indice (`index-migrate`) em macOS e em Windows: so rodou em Linux e nos testes de CI.
+- O BGE pelo llama.cpp com Metal: validado apenas em CPU no Linux.
+- `delegation-core update` das outras maquinas (Max, Luan, William) para a 0.16.1.
+
+**Efeito colateral.** As conexoes MCP das sessoes abertas durante o restart perdem as ferramentas e precisam ser reconectadas (`/mcp`) ou a sessao reiniciada.
+
+---
+
 <!-- Next deployment: append your entry above this line, newest first under its own
      "## <NAME> deployment — <action> — <date>" header. -->
 

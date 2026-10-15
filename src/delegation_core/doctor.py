@@ -138,14 +138,17 @@ def check_engine_mode(cfg) -> dict:
     missing = []
     if not Path(cfg.llama_binary).exists():
         missing.append(f"llama_binary {cfg.llama_binary}")
-    if not Path(cfg.llama_model).exists():
+    modelo_ok = Path(cfg.llama_model).expanduser().exists() or (
+        # mlx_lm aceita um id do Hugging Face e baixa na primeira subida.
+        cfg.motor_e_mlx and cfg.llama_model.strip().count("/") == 1)
+    if not modelo_ok:
         missing.append(f"llama_model {cfg.llama_model}")
     if missing:
         return {"check": "engine_mode", "status": "error",
                 "detail": f"engine_mode={cfg.engine_mode} but missing: {', '.join(missing)}",
                 "fix": 'set engine_mode to "agent", or fix the paths in config.json'}
     return {"check": "engine_mode", "status": "ok",
-            "detail": f"{cfg.engine_mode}: binary and model present"}
+            "detail": f"{cfg.engine_mode} ({'mlx' if cfg.motor_e_mlx else 'llama.cpp'}): binary and model present"}
 
 
 def check_ingest_registry() -> dict:
@@ -252,6 +255,57 @@ def sondar_indice(cfg, timeout: int = 120) -> dict:
 _NTSTATUS_DE_CRASH = frozenset({0xC0000005, 0xC00000FD, -1073741819, -1073741571})
 
 
+#: A busca exata guarda a matriz inteira de vetores em memoria, no daemon e em todo processo
+#: que abre o indice. Medido em 09/10/2026 (vetores de 1024 dimensoes, esta maquina, v0.16.0+):
+#: com 400 mil trechos a abertura a frio leva 4,4 s, o processo ocupa 1,9 GB e a busca leva
+#: 27 ms; a memoria cresce em linha reta com o numero de trechos. Acima deste numero o
+#: custo deixa de ser desprezivel, e o aviso diz isso antes de virar surpresa.
+LIMITE_DE_LINHAS_PARA_AVISO = 500_000
+
+
+def aviso_de_escala_do_indice(linhas: int, dim: int = 1024) -> str:
+    """Texto do aviso quando o indice e grande o bastante para a busca exata pesar, ou ''."""
+    if linhas < LIMITE_DE_LINHAS_PARA_AVISO:
+        return ""
+    gb = linhas * dim * 4 / 1e9
+    return (f"A busca exata guarda a matriz de vetores inteira em memoria (cerca de {gb:.1f} GB aqui, "
+            f"por processo que abre o indice). Medido: com 400 mil trechos, abertura a frio de 4 s, "
+            f"1,9 GB e 27 ms por busca; cresce em linha reta.")
+
+
+def _check_indice_sqlite(cfg, nome: str) -> dict:
+    """Com o indice SQLite, o dano que o Chroma tem (segmentos HNSW sem linha,
+    FTS divergente) nao existe; o que se verifica e a integridade do SQLite."""
+    arquivo = cfg.sqlite_path / "indice.db"
+    if not arquivo.exists():
+        return {"check": nome, "status": "ok", "detail": "no sqlite index built yet"}
+    if nome != "index_integrity":
+        return {"check": nome, "status": "skip",
+                "detail": "does not apply to the sqlite index (single transactional store)"}
+    try:
+        from .indice_sqlite import ClienteSqlite
+        cliente = ClienteSqlite(cfg.sqlite_path)
+        try:
+            veredito = cliente.verificar()
+            linhas = sum(c.count() for c in cliente.list_collections())
+            dims = [int(d) for (d,) in cliente._conexao().execute("SELECT dim FROM colecoes") if d]
+            dim_media = max(dims) if dims else 1024
+        finally:
+            cliente.close()
+    except Exception as e:
+        return {"check": nome, "status": "warn", "detail": f"sqlite index unreadable ({e})",
+                "fix": "delegation-core reindex --force"}
+    if veredito != "ok":
+        return {"check": nome, "status": "warn",
+                "detail": f"PRAGMA integrity_check: {veredito[:200]}",
+                "fix": "delegation-core reindex --force"}
+    aviso = aviso_de_escala_do_indice(linhas, dim_media)
+    if aviso:
+        return {"check": nome, "status": "warn", "detail": f"sqlite index ok, {linhas} chunks. {aviso}",
+                "fix": "docs/indice-sqlite.md, secao Limites: quantizar os vetores ou usar sqlite-vec"}
+    return {"check": nome, "status": "ok", "detail": f"sqlite index ok, {linhas} chunks"}
+
+
 def check_index_location(cfg) -> dict:
     """O indice mora numa pasta que um cliente de nuvem sincroniza?
 
@@ -261,11 +315,11 @@ def check_index_location(cfg) -> dict:
     abertos e causa conhecida de dano, e nada avisava.
     """
     from .config import caminho_local_do_indice, em_pasta_sincronizada
-    if not em_pasta_sincronizada(cfg.chroma_path):
+    if not em_pasta_sincronizada(cfg.index_dir):
         return {"check": "index_location", "status": "ok",
-                "detail": f"index at {cfg.chroma_path}, outside any synced folder"}
+                "detail": f"index at {cfg.index_dir}, outside any synced folder"}
     return {"check": "index_location", "status": "warn",
-            "detail": f"index at {cfg.chroma_path} is inside a cloud-synced folder; "
+            "detail": f"index at {cfg.index_dir} is inside a cloud-synced folder; "
                       "sync touching the database under an open process damages it",
             "fix": "with the daemon stopped: delegation-core recover-index "
                    f"--index-path {caminho_local_do_indice()} (the index is rebuilt "
@@ -296,6 +350,8 @@ def check_index_integrity(cfg) -> dict:
     loading data, which is when the condition appeared. In a child process the
     same crash becomes an answer.
     """
+    if cfg.usa_sqlite:
+        return _check_indice_sqlite(cfg, 'index_integrity')
     if not (cfg.chroma_path / "chroma.sqlite3").exists():
         return {"check": "index_integrity", "status": "ok", "detail": "no index built yet"}
 
@@ -353,6 +409,8 @@ def check_index_integrity(cfg) -> dict:
 
 def check_orphan_segments(cfg) -> dict:
     """Detect segment directories left behind on disk when collections were recreated."""
+    if cfg.usa_sqlite:
+        return _check_indice_sqlite(cfg, 'orphan_segments')
     chroma_dir = cfg.chroma_path
     db_path = chroma_dir / "chroma.sqlite3"
 
@@ -461,6 +519,8 @@ def clean_orphan_segments(cfg) -> int:
 
 def check_fts_integrity(cfg) -> dict:
     """Check whether Chroma SQLite FTS5 fulltext search table is healthy or malformed."""
+    if cfg.usa_sqlite:
+        return _check_indice_sqlite(cfg, 'fts_integrity')
     db_path = cfg.chroma_path / "chroma.sqlite3"
     if not db_path.exists():
         return {"check": "fts_integrity", "status": "ok", "detail": "no chroma database found"}
@@ -629,11 +689,39 @@ def check_devices(cfg, tem_cuda=None) -> dict:
     return {"check": "devices", "status": "ok", "detail": detail}
 
 
+def check_embed_backend(cfg) -> dict:
+    """Em que o BGE roda, e se o Mac Apple Silicon esta no caminho certo.
+
+    No Apple Silicon o BGE deve rodar pelo llama.cpp, ao lado do MLX: o torch em
+    MPS e o caminho que ja derrubou o daemon (DC-47). "auto" so escolhe o
+    llama.cpp quando ele esta pronto, entao um Mac atualizado sem o preparo
+    continua no torch; este check diz isso em vez de deixar passar.
+    """
+    import platform
+
+    from . import embed_llama
+    from .embeddings import resolver_backend
+
+    pedido = (getattr(cfg, "embed_backend", "auto") or "auto").strip().lower()
+    efetivo = resolver_backend(cfg)
+    detail = f"embeddings: {efetivo} (embed_backend={pedido})"
+    if efetivo == "llamacpp" and not embed_llama.configurado(cfg):
+        return {"check": "embed_backend", "status": "error",
+                "detail": detail + "; llama-server ou GGUF nao encontrado",
+                "fix": "delegation-core embed-llama setup"}
+    if efetivo == "torch" and platform.system() == "Darwin" and platform.machine() == "arm64":
+        return {"check": "embed_backend", "status": "warn",
+                "detail": detail + "; o BGE esta no torch/MPS, ao lado do modelo local",
+                "fix": "delegation-core embed-llama setup (o indice e o mesmo, sem reindexar)"}
+    return {"check": "embed_backend", "status": "ok", "detail": detail}
+
+
 def run_all(cfg) -> dict:
     """Run every check. Returns {status, counts, checks[]} with the worst status on top."""
     checks = [
         check_engine_mode(cfg),
         check_devices(cfg),
+        check_embed_backend(cfg),
         check_vault_folders(cfg),
         check_hooks(),
         check_graph_extra(),

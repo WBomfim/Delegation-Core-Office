@@ -108,6 +108,11 @@ class Config:
     ])
 
     # ── llama.cpp ────────────────────────────────────────────────────────────
+    #: Qual servidor roda o modelo local. "llamacpp" (llama-server, GGUF) ou
+    #: "mlx" (mlx_lm.server, Apple Silicon). Com "mlx", `llama_binary` aponta
+    #: para o mlx_lm.server e `llama_model` e a pasta do modelo MLX ou o id do
+    #: repositorio no Hugging Face (ex.: mlx-community/Qwen3.8-27B-8bit).
+    motor_local: str = "llamacpp"
     llama_binary: str = ""
     llama_model: str = ""
     llama_port: int = 8181
@@ -174,11 +179,27 @@ class Config:
     # 0 means "leave the model's own default alone".
     embed_max_seq_length: int = 2048
     embed_batch_size: int = 8
+    # Prazo, em segundos, para carregar o modelo de embeddings (BGE). Estourado, a busca
+    # responde com o motivo no `heartbeat` em vez de ficar pendurada, e a carga
+    # segue em segundo plano. 0 desliga o prazo.
+    embed_load_timeout_sec: float = 600.0
     #: "auto" (o acelerador que existir), "cpu", "cuda" ou "mps". Existe porque
     #: o BGE-m3 e o llama-server nao cabem juntos numa placa de 16 GB, e ate
     #: 09/09/2026 a unica forma de por o encoder na CPU era esconder a placa do
     #: processo inteiro com CUDA_VISIBLE_DEVICES= num drop-in de systemd.
     embed_device: str = "auto"
+    #: "torch" (sentence-transformers), "llamacpp" (llama-server --embeddings) ou
+    #: "auto". Em "auto" so usa o llama.cpp quando ele esta pronto (binario e
+    #: GGUF existem); sem isso fica no torch, para uma atualizacao nunca deixar
+    #: um indice existente sem embedder. O wizard grava "llamacpp" no Mac Apple
+    #: Silicon, onde o BGE nao deve rodar no torch/MPS ao lado do MLX.
+    embed_backend: str = "auto"
+    #: llama-server dos embeddings. Vazio: o `llama-server` do PATH. Separado de
+    #: `llama_binary` porque no Mac este aponta para o mlx_lm.server.
+    embed_llama_binary: str = ""
+    #: GGUF do BGE (f16: o cosseno com o torch e 0,99999, a colecao e a mesma).
+    embed_gguf: str = ""
+    embed_port: int = 8182
 
     # ── v0.12: default search scope ──────────────────────────────────────────
     # "" means adaptive (decided per vault from how much of it is generated).
@@ -249,6 +270,16 @@ class Config:
     # em quarentena um indice nessa situacao. Ver recuperacao.py.
     index_path: str = ""
 
+    # Qual armazenamento guarda o indice vetorial: "sqlite" (indice_sqlite.py: um
+    # arquivo SQLite em WAL com busca exata em numpy, sem os defeitos de corrupcao
+    # abertos do ChromaDB 1.5.x), "chroma" (o antigo, que exige `pip install
+    # delegation-core[chroma]`) ou vazio, que escolhe pelo que existe em disco:
+    # indice SQLite presente -> sqlite; so indice do Chroma -> chroma (nunca troca
+    # sozinho um indice que ja tem dados); nada -> sqlite, que e o de uma
+    # instalacao nova. Trocar de um para o outro e `delegation-core index-migrate`,
+    # nunca na mao: os dois ficam lado a lado e o antigo nao e tocado.
+    index_backend: str = ""
+
     # ── v0.13.1: guard against a second index writer ─────────────────────────
     # When no daemon answers, index commands do the work in this process. That
     # is what keeps the CLI usable on a machine that never installed the
@@ -281,7 +312,7 @@ class Config:
     #            oversized interactive inputs are NOT auto-run: the tool returns
     #            a token-cost estimate plus an explicit offer to run locally
     #            (pass use_local=true) so the choice is surfaced, never silent.
-    # BGE embeddings + ChromaDB search always run locally in every mode.
+    # BGE embeddings + the vector index search always run locally in every mode.
     engine_mode: str = "local"
 
     # ── v0.5.1: hybrid routing ───────────────────────────────────────────────
@@ -359,6 +390,22 @@ class Config:
     # ── derived ──────────────────────────────────────────────────────────────
 
     @property
+    def motor_e_mlx(self) -> bool:
+        return (getattr(self, "motor_local", "llamacpp") or "").strip().lower() == "mlx"
+
+    @property
+    def modelo_no_pedido(self) -> str:
+        """O campo "model" de cada pedido ao servidor local.
+
+        O llama-server ignora o campo; o mlx_lm.server nao: um nome que ele nao
+        conhece vira um pedido para CARREGAR aquele repositorio. Medido em
+        06/10/2026 com mlx-lm 0.32: "local" falha em toda chamada ("Cannot find
+        an appropriate cached snapshot"), e "default_model" usa o modelo que o
+        servidor subiu com --model.
+        """
+        return "default_model" if self.motor_e_mlx else "local"
+
+    @property
     def llama_url(self) -> str:
         return f"http://localhost:{self.llama_port}"
 
@@ -378,6 +425,26 @@ class Config:
         return self.vault / ".chroma_bge"
 
     @property
+    def usa_sqlite(self) -> bool:
+        escolha = str(self.index_backend or "").strip().lower()
+        if escolha in ("sqlite", "chroma"):
+            return escolha == "sqlite"
+        if (self.sqlite_path / "indice.db").exists():
+            return True
+        # Um indice do Chroma com dados nao e trocado por um vazio sem ninguem pedir.
+        return not (self.chroma_path / "chroma.sqlite3").exists()
+
+    @property
+    def sqlite_path(self) -> Path:
+        """Pasta do indice SQLite: ao lado do indice do Chroma, nunca por cima dele."""
+        return self.vault / ".indice_sqlite"
+
+    @property
+    def index_dir(self) -> Path:
+        """A pasta do indice que esta em uso, qualquer que seja o backend."""
+        return self.sqlite_path if self.usa_sqlite else self.chroma_path
+
+    @property
     def collection_name(self) -> str:
         """ChromaDB collection for the configured embedding model.
 
@@ -392,6 +459,10 @@ class Config:
     @property
     def log_path(self) -> Path:
         return CONFIG_DIR / "server.log"
+
+    @property
+    def embed_log_path(self) -> Path:
+        return CONFIG_DIR / "embed_llama.log"
 
     @property
     def llama_log_path(self) -> Path:

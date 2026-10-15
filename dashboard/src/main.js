@@ -2,6 +2,7 @@
 // Pure Vanilla JS (Strict CSP) - connects to local dashboard_api.py sidecar.
 
 let apiBase = null;
+let apiToken = "";
 let currentNotePath = null;
 let currentRawMode = false;
 let currentNoteContent = "";
@@ -9,8 +10,13 @@ let isServerActive = true;
 
 // ── API Helpers ───────────────────────────────────────────────────────────────
 
+// The API rejects every request without the daemon's bearer token.
+function authHeaders(extra = {}) {
+  return apiToken ? { ...extra, Authorization: `Bearer ${apiToken}` } : extra;
+}
+
 async function apiGet(path) {
-  const res = await fetch(`${apiBase}${path}`);
+  const res = await fetch(`${apiBase}${path}`, { headers: authHeaders() });
   const body = await res.json();
   if (!res.ok) throw new Error(body.error || `${path}: HTTP ${res.status}`);
   return body;
@@ -19,7 +25,7 @@ async function apiGet(path) {
 async function apiPost(path, payload) {
   const res = await fetch(`${apiBase}${path}`, {
     method: "POST",
-    headers: { "Content-Type": "application/json" },
+    headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(payload),
   });
   const body = await res.json();
@@ -164,7 +170,7 @@ async function refreshStatus() {
       stat("Binary", `${dot(s.binary_ok)}${s.binary_ok ? "ok" : "missing"}`),
       stat("Model", `${dot(s.model_ok)}${s.model_ok ? "ok" : "missing"}`),
       stat("llama.cpp", `${dot(s.llama_state === "online")}${escapeHtml(s.llama_state)}`),
-      stat("Indexed notes", escapeHtml(s.chroma_indexed_notes ?? "—")),
+      stat("Indexed notes", escapeHtml(s.indexed_notes ?? s.chroma_indexed_notes ?? "—")),
       stat("Engine mode", escapeHtml(s.engine_mode)),
       stat("Synthesis", s.synthesis_enabled ? "on" : "off"),
     ].join("");
@@ -177,7 +183,8 @@ async function refreshStatus() {
 
     // Sync Obsidian Statusbar
     const sbNotes = document.getElementById("sb-notes-val");
-    if (sbNotes && s.chroma_indexed_notes !== undefined) sbNotes.textContent = `${s.chroma_indexed_notes} notes`;
+    const nIndexed = s.indexed_notes ?? s.chroma_indexed_notes;
+    if (sbNotes && nIndexed !== undefined) sbNotes.textContent = `${nIndexed} notes`;
     const sbModel = document.getElementById("sb-model-val");
     if (sbModel && s.bge_model) sbModel.textContent = s.bge_model.rsplit ? s.bge_model.rsplit('/', 1).pop() : s.bge_model;
     const sbEngine = document.getElementById("sb-engine-val");
@@ -1850,6 +1857,14 @@ async function getApiPort() {
   return 8182;
 }
 
+async function getApiToken() {
+  if (window.__TAURI_INTERNALS__) {
+    const { invoke } = window.__TAURI_INTERNALS__;
+    return await invoke("get_api_token");
+  }
+  return "";
+}
+
 async function main() {
   // The UI is wired up before the sidecar is contacted, and unconditionally.
   // Previously a failed port lookup returned here, which left the whole window
@@ -1874,6 +1889,7 @@ async function main() {
   // says so, instead of presenting a frozen shell with no explanation.
   try {
     const port = await getApiPort();
+    apiToken = await getApiToken();
     apiBase = `http://127.0.0.1:${port}`;
   } catch (e) {
     console.error("Could not determine sidecar port", e);

@@ -15,20 +15,27 @@ do delegation-core nesta máquina (ver "Regras" no fim).
 
 ## Como a integração funciona (leia antes de mexer)
 
-Conferido no código de produção (`src/delegation_core/engine.py`) em 2026-09-28:
+Conferido no código de produção (`src/delegation_core/engine.py`) e medido contra o
+`mlx_lm.server` 0.32 de verdade em 2026-10-06:
 
-- O delegation-core fala com o motor em `http://localhost:{llama_port}`. Usa só dois
-  endpoints: `GET /health` e `POST /v1/chat/completions`.
-- Antes de cada chamada ele testa `/health`. Se responder 200, usa o servidor que já
-  está no ar e **nunca tenta subir outro**. Só quando `/health` falha ele tenta lançar
-  `llama_binary` com flags do llama.cpp (`--ctx-size`, `-fa`, `-ctk`), que o
-  `mlx_lm.server` não aceita. Ou seja: com o MLX no ar, tudo funciona; com o MLX fora,
-  o delegation-core falha com erro no log em vez de consertar sozinho. É o esperado.
-- O desligamento por ociosidade (`local_idle_shutdown_sec`) só mata processo que o
-  próprio delegation-core iniciou. O serviço do MLX nunca é tocado.
-- Toda requisição manda `"model": "local"` (valor fixo no código) e
-  `"chat_template_kwargs": {"enable_thinking": false}`. **Esses dois campos são os
-  pontos de risco**: a etapa 6 testa se o `mlx_lm.server` aceita os dois.
+- Com `"motor_local": "mlx"` na config, o delegation-core trata o `mlx_lm.server` como
+  motor proprio. Ele fala com o motor em `http://localhost:{llama_port}`, so por
+  `GET /health` e `POST /v1/chat/completions`.
+- Antes de cada chamada ele testa `/health`. Se responder 200, usa o servidor que ja
+  esta no ar (o LaunchAgent da etapa 5) e nunca sobe outro. Se nao responder, ele
+  mesmo sobe o `mlx_lm.server` com `--model`, `--host`, `--port` e
+  `--chat-template-args`, e espera ate 300 s (um 27B de 8 bits sao ~30 GB lidos do
+  disco).
+- O desligamento por ociosidade (`local_idle_shutdown_sec`) so mata processo que o
+  proprio delegation-core iniciou. O servico do LaunchAgent nunca e tocado.
+- Cada pedido manda `"model": "default_model"`, que o `mlx_lm.server` entende como o
+  modelo carregado por `--model`. **Ate 2026-10-06 o codigo mandava `"local"`, e o
+  `mlx_lm.server` tratava isso como um repositorio a baixar: toda geracao falhava.**
+  Atualize o delegation-core antes de usar o MLX.
+- `"chat_template_kwargs": {"enable_thinking": false}` e aceito pelo `mlx_lm.server`
+  e desliga o raciocinio por pedido.
+- Modelos novos: o `mlx-lm` 0.32 ja traz as arquiteturas `qwen3_5`, `qwen3_next`,
+  `gemma4`, `gpt_oss`, `llama4` e `mistral4`. Use 0.32 ou mais novo.
 
 Porta: use **8181**, que é o `llama_port` padrão do delegation-core. Assim a config não
 precisa de porta diferente e não há dois lugares para manter sincronizados.
@@ -64,7 +71,7 @@ precisa de porta diferente e não há dois lugares para manter sincronizados.
 ## 4. Limite de memória da GPU, persistente
 
 Orçamento: pesos 8-bit de um 27B ocupam perto de 28 a 30 GB. O BGE-M3 do
-delegation-core roda no mesmo chip (via `mps`) e ocupa mais uns 2 GB. Por isso o alvo
+delegation-core roda ao lado, pelo llama.cpp (etapa 8), e ocupa mais uns 2 GB. Por isso o alvo
 de 40 GB para a GPU, deixando cerca de 8 GB para o macOS.
 
 - Crie `/Library/LaunchDaemons/com.local.gpu-wired-limit.plist` que rode
@@ -105,7 +112,7 @@ curl -s -o /dev/null -w "%{http_code}\n" http://127.0.0.1:8181/health
 # b) exatamente o formato que o delegation-core envia
 curl -s http://127.0.0.1:8181/v1/chat/completions \
   -H "Content-Type: application/json" \
-  -d '{"model":"local","messages":[{"role":"user","content":"Responda so: ok"}],
+  -d '{"model":"default_model","messages":[{"role":"user","content":"Responda so: ok"}],
        "max_tokens":50,"temperature":0.0,
        "chat_template_kwargs":{"enable_thinking":false}}'
 
@@ -119,8 +126,8 @@ Resultados possíveis:
 - **`/health` não dá 200**: o delegation-core vai achar que o motor está fora. Pare e
   relate a versão do `mlx-lm` e o código HTTP.
 - **`"model":"local"` dá erro** (o servidor tenta baixar um repositório chamado
-  `local`): pare e relate a mensagem. A correção é no delegation-core (tornar o nome
-  do modelo configurável), feita no repositório de produção, não aqui.
+  `local`): e o esperado, e e por isso que o delegation-core manda `"default_model"`
+  com `motor_local: "mlx"`. Repita (b) com `"model":"default_model"`: tem que passar.
 - **Resposta vem com raciocínio ou vazia**: confira se o `--chat-template-args` da
   etapa 5 foi aplicado; se não existir essa opção, relate.
 
@@ -146,20 +153,37 @@ Edite `~/.delegation_core/config.json` (faça backup antes:
 ```json
 {
   "engine_mode": "hybrid",
+  "motor_local": "mlx",
   "llama_port": 8181,
   "llama_binary": "/Users/<usuario>/mlx-server/.venv/bin/mlx_lm.server",
   "llama_model": "/Users/<usuario>/.cache/huggingface/hub/models--<...>/snapshots/<hash>",
-  "embed_device": "mps",
+  "embed_backend": "llamacpp",
+  "embed_llama_binary": "/opt/homebrew/bin/llama-server",
+  "embed_gguf": "/Users/<usuario>/.delegation_core/models/bge-m3-f16.gguf",
+  "embed_port": 8182,
   "budget_mode": "auto"
 }
 ```
 
+Os campos `embed_*` não precisam ser escritos à mão: `delegation-core embed-llama setup`
+acha ou baixa o `llama-server`, baixa o GGUF e grava tudo (o wizard faz o mesmo no Mac).
+
 Por que cada campo:
 
-- `llama_binary` e `llama_model` precisam apontar para arquivos que existem, senão
-  `is_configured()` e o `delegation-core doctor` acusam configuração incompleta. Eles
-  não são usados para subir nada enquanto o MLX responder.
-- `embed_device: mps` coloca o BGE no chip. Se der erro de memória, troque por `cpu`.
+- `motor_local: "mlx"` faz o delegation-core mandar o nome de modelo que o MLX entende
+  e, se o servidor cair, subir o `mlx_lm.server` com os argumentos dele.
+- `llama_binary` aponta para o `mlx_lm.server` do venv. `llama_model` pode ser a pasta
+  do snapshot ou o id do repositorio (`mlx-community/...`); com o id, o `doctor` aceita
+  e o `mlx_lm` baixa na primeira subida.
+- `embed_backend: "llamacpp"`: o BGE roda num `llama-server --embeddings` (porta
+  `embed_port`), ao lado do `mlx_lm.server`, em vez de rodar no torch/MPS, que é o caminho
+  que já derrubou o daemon por alocação de buffer na memória unificada. O GGUF f16 dá o
+  mesmo vetor do torch (cosseno 0,99999 medido com o bge-m3), então a coleção é a mesma e
+  um índice já feito continua valendo, sem reindexar. O `llama-server` sobe sozinho na
+  primeira busca e sai junto com o processo que o subiu.
+- Num Mac que já tinha `embed_device: mps` e foi só atualizado, `embed_backend` fica em
+  `auto` e o BGE segue no torch até você rodar `delegation-core embed-llama setup`; o
+  `delegation-core doctor` avisa isso.
 - `budget_mode: auto` usa a velocidade medida (`tok_sec`) para limitar tokens por
   tarefa. Rode a calibração depois da etapa 9 para preencher `tok_sec`.
 - Não mexa em `server_token`, `vault_path` nem nas pastas do vault.
