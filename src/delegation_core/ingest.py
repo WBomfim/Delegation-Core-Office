@@ -126,6 +126,9 @@ def fontes_do_indice(chroma_dir: Path) -> dict[str, dict[str, str]]:
     """
     import sqlite3
 
+    sqlite_idx = Path(chroma_dir) / "indice.db"
+    if sqlite_idx.exists():
+        return _fontes_do_indice_sqlite(sqlite_idx)
     banco = Path(chroma_dir) / "chroma.sqlite3"
     if not banco.exists():
         return {}
@@ -152,6 +155,27 @@ def fontes_do_indice(chroma_dir: Path) -> dict[str, dict[str, str]]:
         # Um arquivo em chunks tem uma linha por chunk, todas com o mesmo
         # ingested_at; o maior cobre o caso de reingestao parcial.
         arquivos[arquivo] = max(arquivos.get(arquivo, ""), meta.get("ingested_at") or "")
+    return fontes
+
+
+def _fontes_do_indice_sqlite(banco: Path) -> dict[str, dict[str, str]]:
+    """O mesmo que `fontes_do_indice`, para o indice SQLite (indice_sqlite.py)."""
+    import sqlite3
+
+    conexao = sqlite3.connect(f"file:{banco}?mode=ro", uri=True, timeout=30)
+    try:
+        linhas = conexao.execute(
+            "SELECT json_extract(meta,'$.source_folder'), json_extract(meta,'$.path'), "
+            "json_extract(meta,'$.ingested_at') FROM chunks "
+            "WHERE json_extract(meta,'$.is_external')='true'").fetchall()
+    finally:
+        conexao.close()
+    fontes: dict[str, dict[str, str]] = {}
+    for fonte, arquivo, em in linhas:
+        if not fonte or not arquivo:
+            continue
+        arquivos = fontes.setdefault(fonte, {})
+        arquivos[arquivo] = max(arquivos.get(arquivo, ""), em or "")
     return fontes
 
 
@@ -275,7 +299,7 @@ def _merge_patterns(*groups) -> list[str]:
 
 
 class IngestManager:
-    """Index external files into the vault's ChromaDB without touching them on disk.
+    """Index external files into the vault's search index without touching them on disk.
 
     External results are tagged folder='_external' so search_vault can distinguish
     them from vault notes. Each file's absolute path is the ChromaDB document ID,
@@ -285,6 +309,24 @@ class IngestManager:
     def __init__(self, vault_manager):
         self._vault = vault_manager
         self._cfg = vault_manager.cfg
+
+    def _arquivos_no_indice(self, source_key: str) -> set[str] | None:
+        """Os arquivos desta fonte que o indice tem de fato, ou None se nao der para saber.
+
+        None mantem o comportamento antigo (confiar no carimbo): uma consulta que
+        falha nao pode ser o motivo de uma ingestao nao rodar.
+        """
+        try:
+            self._vault._ensure_ready()
+            collection = getattr(self._vault, "collection", None)
+            if collection is None:
+                return None
+            linhas = _paged_get(collection, where={"source_folder": source_key},
+                                include=["metadatas"])
+            return {m.get("path") for m in (linhas.get("metadatas") or []) if isinstance(m, dict)}
+        except Exception as e:
+            logger.warning("Nao consegui conferir o indice para %s (%s); confiando no carimbo", source_key, e)
+            return None
 
     def _configured_source_for(self, source: Path) -> dict | None:
         """Find the configured source that exactly authorizes ``source``."""
@@ -400,6 +442,12 @@ class IngestManager:
         source_meta = registry.get(source_key, {})
         cached_files = source_meta.get("files", {})
         new_cached_files = {}
+        # O carimbo do registro diz que o ARQUIVO nao mudou, nao que o INDICE tem
+        # as linhas dele. Com o indice recriado, esvaziado ou trocado, pular so pelo
+        # carimbo devolve "0 files" sem reembutir nada, e o proximo passo e achar
+        # que a ingestao rodou. Por isso o indice e consultado uma vez por fonte.
+        presentes = None if force else self._arquivos_no_indice(source_key)
+        reingeridos_sem_linhas: list[str] = []
 
         for f in candidates:
             f_str = str(f)
@@ -417,7 +465,9 @@ class IngestManager:
             if not force and f_str in cached_files:
                 c_info = cached_files[f_str]
                 if isinstance(c_info, (list, tuple)) and len(c_info) >= 2:
-                    if c_info[0] == f_mtime and c_info[1] == f_size:
+                    if c_info[0] == f_mtime and c_info[1] == f_size and presentes is not None and f_str not in presentes:
+                        reingeridos_sem_linhas.append(f_str)
+                    elif c_info[0] == f_mtime and c_info[1] == f_size:
                         # Counted as unchanged, NOT as indexed. Reporting a skip
                         # as an index made "N arquivos reingeridos" indistinguishable
                         # from "N arquivos already present": the number stayed
@@ -506,6 +556,7 @@ class IngestManager:
             "skipped_unreadable": len(skipped_unreadable),
             "skipped_dataless":   len(skipped_dataless),
             "skipped_unchanged":  len(skipped_unchanged),
+            "reindexed_missing_from_index": len(reingeridos_sem_linhas),
             "errors":             errors,
         }
         if configured_source is not None:
