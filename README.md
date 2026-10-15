@@ -177,7 +177,7 @@ real model to say anything useful.
 - `AGENT_GUIDE.md` - full MCP tool reference and protocol, written for the AI agent side.
 - `CHANGELOG.md` - version history.
 - `DEPLOYMENT_LOG.md` - per-deployment upgrade notes (this repo runs on more than one machine).
-- `docs/INSTALLATION_AND_OPERATION.md` - installation, MCP connection, validation, ingestion, and update runbook.
+- `docs/INSTALL_AND_OPERATION.md` - installation, MCP connection, validation, ingestion, and update runbook.
 - `docs/ATUALIZAR.md` - updating an install from GitHub with `delegation-core update`, and when to migrate the index.
 - `docs/evals-de-busca.md` - the retrieval evals that run with the test suite: 40 notes, 40 questions, and a baseline that fails when search gets worse.
 - `docs/INGEST_CONFIGURATION.md` - declarative ingestion sources, exclusions and safe re-ingestion.
