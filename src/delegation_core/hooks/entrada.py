@@ -24,6 +24,13 @@ from typing import Callable
 
 USO = "uso: delegation-core-hook {session-start|session-end|codex-session-start|codex-session-end}"
 
+# The constants are only exposed by subprocess on Windows. Keep their documented
+# values here so the stdlib-only hook can be imported and unit-tested on POSIX
+# while still creating the intended Windows process flags at runtime.
+DETACHED_PROCESS = getattr(subprocess, "DETACHED_PROCESS", 0x00000008)
+CREATE_NEW_PROCESS_GROUP = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0x00000200)
+CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0x08000000)
+
 
 def _passo(nome: str, fazer: Callable[[], object]) -> None:
     try:
@@ -58,12 +65,16 @@ def session_end(raw: str, client: str = "claude") -> None:
     _passo("llama_session_stop", lambda: llama_session_stop.main(raw))
 
 
+def _is_windows() -> bool:
+    return os.name == "nt"
+
+
 def _detached_popen_kwargs() -> dict:
-    if os.name == "nt":
+    if _is_windows():
         # Do not create a visible console for the short-lived export worker.
         # A normal child outlives its parent on Windows; CREATE_NO_WINDOW keeps
         # that child headless while its own process group isolates Ctrl+C.
-        return {"creationflags": subprocess.CREATE_NO_WINDOW | subprocess.CREATE_NEW_PROCESS_GROUP}
+        return {"creationflags": DETACHED_PROCESS | CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP}
     return {"start_new_session": True}
 
 
@@ -125,7 +136,6 @@ def session_end_file(payload: str) -> None:
         data = json.loads(raw)
     except json.JSONDecodeError:
         return
-    transcript = data.get("transcript_path") if isinstance(data, dict) else None
     snapshot_path = data.get("_delegation_core_snapshot_path") if isinstance(data, dict) else None
     try:
         session_end(raw, client="codex")
